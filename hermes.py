@@ -25,6 +25,7 @@ BANNER = rf"""
     ░░░░░   ░░░░░  ░░░░░░  ░░░░░     ░░░░░ ░░░ ░░░░░  ░░░░░░  ░░░░░░
 
                        Email sender via Graph API v{VERSION}
+                       By: Guilherme Galvão
 
 Inspired in part by the GraphRunner project
 https://github.com/dafthack/GraphRunner
@@ -604,5 +605,6 @@ if __name__ == "__main__":
     if args.attachments and args.is_inline:
         if len(args.attachments) != len(args.is_inline):
             parser.error("Number of --attachments and --is-inline arguments must match")
+
 
     main(args)
