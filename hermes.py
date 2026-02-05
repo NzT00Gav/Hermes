@@ -12,7 +12,7 @@ from pathlib import Path
 from typing import Dict, Any, Optional, List
 import requests
 
-VERSION = "0.1.0"
+VERSION = "0.1.1"
 
 BANNER = rf"""
      █████   █████
@@ -371,7 +371,8 @@ def format_sleep_time(seconds: int) -> str:
 def send_mail(access_token: str, subject: str, email_body: str, recipients: List[str],
               attachment_objects: List[Dict[str, Any]], sleep_time: int = DEFAULT_SLEEP_SECONDS,
               jitter: float = 0.0, save_to_sent: bool = True, subject_list: Optional[List[str]] = None,
-              content_type: str = "html", cc_recipients: Optional[List[str]] = None):
+              content_type: str = "html", cc_recipients: Optional[List[str]] = None,
+              bcc_recipients: Optional[List[str]] = None):
 
     url = "https://graph.microsoft.com/v1.0/me/sendMail"
     headers = {
@@ -393,6 +394,9 @@ def send_mail(access_token: str, subject: str, email_body: str, recipients: List
 
     if cc_recipients:
         print(f"[*] CC: {len(cc_recipients)} recipient(s) in copy")
+
+    if bcc_recipients:
+        print(f"[*] BCC: {len(bcc_recipients)} recipient(s) in blind copy")
 
     print()
 
@@ -419,6 +423,11 @@ def send_mail(access_token: str, subject: str, email_body: str, recipients: List
         if cc_recipients:
             message_obj["ccRecipients"] = [
                 {"emailAddress": {"address": cc}} for cc in cc_recipients
+            ]
+
+        if bcc_recipients:
+            message_obj["bccRecipients"] = [
+                {"emailAddress": {"address": bcc}} for bcc in bcc_recipients
             ]
 
         json_body = {
@@ -488,6 +497,12 @@ def main(args):
     if args.cc_list:
         cc_recipients.extend(list_from_file(args.cc_list))
 
+    bcc_recipients = []
+    if args.bcc:
+        bcc_recipients.append(args.bcc)
+    if args.bcc_list:
+        bcc_recipients.extend(list_from_file(args.bcc_list))
+
     attachment_objects = []
     if args.attachments:
         if len(args.attachments) != len(args.is_inline):
@@ -516,6 +531,10 @@ def main(args):
         print(f"[*] CC: {len(cc_recipients)} address(es)")
         for i, cc in enumerate(cc_recipients, 1):
             print(f"    [{i}] {cc}")
+    if bcc_recipients:
+        print(f"[*] BCC: {len(bcc_recipients)} address(es)")
+        for i, bcc in enumerate(bcc_recipients, 1):
+            print(f"    [{i}] {bcc}")
     if attachment_objects:
         print(f"[*] Attachments: {len(attachment_objects)}")
         for i, att in enumerate(attachment_objects, 1):
@@ -535,7 +554,8 @@ def main(args):
         jitter=args.jitter if args.jitter else 0.0,
         subject_list=subject_list,
         content_type=content_type,
-        cc_recipients=cc_recipients if cc_recipients else None
+        cc_recipients=cc_recipients if cc_recipients else None,
+        bcc_recipients=bcc_recipients if bcc_recipients else None
     )
 
 class BuildParser(argparse.ArgumentParser):
@@ -571,6 +591,11 @@ if __name__ == "__main__":
     parser.add_argument("-C", "--cc-list", type=str,
                        help="File with list of CC email addresses (one per line). All addresses will be CC'd on every email.")
 
+    parser.add_argument("-b", "--bcc", type=email_type,
+                       help="Email address to BCC (blind carbon copy).")
+    parser.add_argument("-B", "--bcc-list", type=str,
+                       help="File with list of BCC email addresses (one per line). All addresses will be BCC'd on every email.")
+
     parser.add_argument("-a", "--attachments", type=existing_file, nargs="+",
                        help="Attachment files", default=[])
     parser.add_argument("-i", "--is-inline", type=parse_bool, nargs="+",
@@ -605,6 +630,5 @@ if __name__ == "__main__":
     if args.attachments and args.is_inline:
         if len(args.attachments) != len(args.is_inline):
             parser.error("Number of --attachments and --is-inline arguments must match")
-
 
     main(args)
