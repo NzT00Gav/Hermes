@@ -11,7 +11,7 @@
     ░░░░░   ░░░░░  ░░░░░░  ░░░░░     ░░░░░ ░░░ ░░░░░  ░░░░░░  ░░░░░░
 ```
 
-**Version:** 0.1.0
+**Version:** 0.1.1
 
 ---
 ### Description
@@ -75,6 +75,8 @@ python hermes.py [options]
 |----------|-------------|
 | `-c, --cc EMAIL` | Email address to CC |
 | `-C, --cc-list FILE` | File with list of CC addresses (one per line) |
+| `-b, --bcc EMAIL` | Email address to BCC (blind carbon copy) |
+| `-B, --bcc-list FILE` | File with list of BCC (blind carbon copy) addresses (one per line) |
 
 #### Attachments
 
