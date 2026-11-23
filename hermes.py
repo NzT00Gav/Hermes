@@ -6,8 +6,15 @@ import json
 import base64
 import mimetypes
 import random
+import smtplib
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from email import encoders
+from email.header import Header
+from email.mime.base import MIMEBase
+from email.mime.multipart import MIMEMultipart
+from email.mime.text import MIMEText
+from email.utils import formataddr, parseaddr
 from pathlib import Path
 from typing import Dict, Any, Optional, List
 import requests
@@ -24,7 +31,7 @@ BANNER = rf"""
      █████   █████░░██████  █████     █████░███ █████░░██████  ██████
     ░░░░░   ░░░░░  ░░░░░░  ░░░░░     ░░░░░ ░░░ ░░░░░  ░░░░░░  ░░░░░░
 
-                       Email sender via Graph API v{VERSION}
+                       Email sender (Graph API / SMTP) v{VERSION}
                        By: Guilherme Galvão
 
 Inspired in part by the GraphRunner project
@@ -470,9 +477,242 @@ def send_mail(access_token: str, subject: str, email_body: str, recipients: List
     print(f"  Failed sends: {error_count}")
     print(f"{'='*40}")
 
+
+# ---------------------------------------------------------------------------
+# SMTP
+# ---------------------------------------------------------------------------
+
+def _encode_display_name(name: str) -> str:
+    try:
+        name.encode("ascii")
+        return name
+    except UnicodeEncodeError:
+        return Header(name, "utf-8").encode()
+
+
+def _format_address(addr_str: str) -> str:
+    display, addr = parseaddr(addr_str)
+    if display:
+        return formataddr((_encode_display_name(display), addr))
+    return addr
+
+
+def _encode_subject(subject: str) -> str:
+    try:
+        subject.encode("ascii")
+        return subject
+    except UnicodeEncodeError:
+        return Header(subject, "utf-8").encode()
+
+
+IMPORTANCE_HEADERS = {
+    "high":   {"Importance": "High", "X-Priority": "1", "X-MSMail-Priority": "High"},
+    "normal": {"Importance": "Normal", "X-Priority": "3", "X-MSMail-Priority": "Normal"},
+    "low":    {"Importance": "Low", "X-Priority": "5", "X-MSMail-Priority": "Low"},
+}
+
+
+def _build_mime_message(
+    subject: str,
+    from_addr: str,
+    to_addr: str,
+    body: str,
+    content_type: str,
+    attachments: List[Path],
+    inline_flags: List[bool],
+    cc: Optional[List[str]] = None,
+    bcc: Optional[List[str]] = None,
+    importance: str = "normal",
+) -> MIMEBase:
+
+    body_part = MIMEText(body, content_type, "utf-8")
+
+    inline_parts: List[MIMEBase] = []
+    regular_parts: List[MIMEBase] = []
+    cid_counter = 1
+
+    for i, path in enumerate(attachments):
+        is_inline = inline_flags[i] if i < len(inline_flags) else False
+        ctype = sniff_mime(path)
+        maintype, subtype = ctype.split("/", 1) if "/" in ctype else ("application", "octet-stream")
+
+        try:
+            data = path.read_bytes()
+        except OSError as e:
+            raise RuntimeError(f"Error reading attachment '{path}': {e}") from e
+
+        part = MIMEBase(maintype, subtype)
+        part.set_payload(data)
+        encoders.encode_base64(part)
+
+        if is_inline:
+            cid = f"attachment_cid{cid_counter}"
+            part.add_header("Content-ID", f"<{cid}>")
+            part.add_header("Content-Disposition", "inline", filename=path.name)
+            inline_parts.append(part)
+            cid_counter += 1
+        else:
+            part.add_header("Content-Disposition", "attachment", filename=path.name)
+            regular_parts.append(part)
+
+    # Build MIME tree:
+    # inline attachments → multipart/related wrapping body + inline parts
+    # regular attachments → multipart/mixed as outer container
+    if inline_parts:
+        related = MIMEMultipart("related")
+        related.attach(body_part)
+        for p in inline_parts:
+            related.attach(p)
+        inner: MIMEBase = related
+    else:
+        inner = body_part
+
+    if regular_parts:
+        mixed = MIMEMultipart("mixed")
+        mixed.attach(inner)
+        for p in regular_parts:
+            mixed.attach(p)
+        root: MIMEBase = mixed
+    else:
+        root = inner
+
+    root["Subject"] = _encode_subject(subject)
+    root["From"] = _format_address(from_addr)
+    root["To"] = to_addr
+    if cc:
+        root["Cc"] = ", ".join(cc)
+
+    for header, value in IMPORTANCE_HEADERS.get(importance, {}).items():
+        root[header] = value
+
+    return root
+
+
+def send_mail_smtp(
+    smtp_server: str,
+    smtp_port: int,
+    smtp_user: str,
+    smtp_password: str,
+    smtp_from: str,
+    subject: str,
+    email_body: str,
+    recipients: List[str],
+    attachments: List[Path],
+    inline_flags: List[bool],
+    sleep_time: int = DEFAULT_SLEEP_SECONDS,
+    jitter: float = 0.0,
+    subject_list: Optional[List[str]] = None,
+    content_type: str = "html",
+    cc_recipients: Optional[List[str]] = None,
+    bcc_recipients: Optional[List[str]] = None,
+    use_ssl: bool = False,
+    importance: str = "normal",
+) -> None:
+
+    _, envelope_sender = parseaddr(smtp_from)
+    if not envelope_sender:
+        envelope_sender = smtp_from
+
+    success_count = 0
+    error_count = 0
+    total = len(recipients)
+
+    print(f"\n[*] Sending to {total} recipient(s) via SMTP ({smtp_server}:{smtp_port})")
+    print(f"[*] Interval between sends: {format_sleep_time(sleep_time)}")
+    print(f"[*] Body format: {content_type.upper()}")
+    if subject_list:
+        print(f"[*] Using list of {len(subject_list)} subject(s) (random selection)")
+    if cc_recipients:
+        print(f"[*] CC: {len(cc_recipients)} recipient(s) in copy")
+    if bcc_recipients:
+        print(f"[*] BCC: {len(bcc_recipients)} recipient(s) in blind copy")
+    print()
+
+    def connect() -> smtplib.SMTP:
+        if use_ssl:
+            conn = smtplib.SMTP_SSL(smtp_server, smtp_port, timeout=30)
+        else:
+            conn = smtplib.SMTP(smtp_server, smtp_port, timeout=30)
+            conn.ehlo()
+            conn.starttls()
+            conn.ehlo()
+        conn.login(smtp_user, smtp_password)
+        return conn
+
+    smtp_conn = connect()
+
+    for i, recipient in enumerate(recipients):
+        current_subject = random.choice(subject_list) if subject_list else subject
+
+        print(f"\n[{i+1}/{total}] Sending to: {recipient}")
+        print(f"    Subject: {current_subject}")
+
+        try:
+            msg = _build_mime_message(
+                subject=current_subject,
+                from_addr=smtp_from,
+                to_addr=recipient,
+                body=email_body,
+                content_type=content_type,
+                attachments=attachments,
+                inline_flags=inline_flags,
+                cc=cc_recipients,
+                bcc=bcc_recipients,
+                importance=importance,
+            )
+        except RuntimeError as e:
+            print(f"    [-] Failed to build message: {e}")
+            error_count += 1
+            continue
+
+        all_rcpt = [recipient]
+        if cc_recipients:
+            all_rcpt.extend(cc_recipients)
+        if bcc_recipients:
+            all_rcpt.extend(bcc_recipients)
+
+        try:
+            smtp_conn.sendmail(envelope_sender, all_rcpt, msg.as_string())
+            print(f"    [+] Email sent successfully!")
+            success_count += 1
+        except smtplib.SMTPServerDisconnected:
+            print(f"    [!] Connection lost, reconnecting...")
+            try:
+                smtp_conn = connect()
+                smtp_conn.sendmail(envelope_sender, all_rcpt, msg.as_string())
+                print(f"    [+] Email sent successfully after reconnect!")
+                success_count += 1
+            except Exception as e:
+                print(f"    [-] Error after reconnect: {e}")
+                error_count += 1
+        except Exception as e:
+            print(f"    [-] Error: {e}")
+            error_count += 1
+
+        if i < total - 1:
+            actual_sleep = sleep_time
+            if jitter > 0.0:
+                variation = random.uniform(-jitter, jitter) * sleep_time
+                actual_sleep = max(1, int(sleep_time + variation))
+                print(f"[*] Waiting {format_sleep_time(actual_sleep)} (jitter applied)")
+            else:
+                print(f"[*] Waiting {format_sleep_time(sleep_time)}")
+            time.sleep(actual_sleep)
+
+    try:
+        smtp_conn.quit()
+    except Exception:
+        pass
+
+    print(f"\n{'='*40}")
+    print(f"  Total recipients: {total}")
+    print(f"  Successful sends: {success_count}")
+    print(f"  Failed sends:     {error_count}")
+    print(f"{'='*40}")
+
+
 def main(args):
-    auth_result = get_graph_tokens(verbose=args.verbose, force_new=args.new_auth)
-    access_token = auth_result.tokens["access_token"]
+    smtp_mode = bool(args.smtp_server)
 
     if args.message_file:
         try:
@@ -503,19 +743,7 @@ def main(args):
     if args.bcc_list:
         bcc_recipients.extend(list_from_file(args.bcc_list))
 
-    attachment_objects = []
-    if args.attachments:
-        if len(args.attachments) != len(args.is_inline):
-            print("[!] -a/--attachments and -i/--is-inline must have the same number of arguments")
-            sys.exit(2)
-
-        try:
-            attachment_objects = build_attachments(
-                attachments=args.attachments,
-                inline_flags=args.is_inline
-            )
-        except RuntimeError as e:
-            raise SystemExit(str(e))
+    content_type = "text" if args.text else "html"
 
     print("\n" + BANNER)
 
@@ -535,28 +763,85 @@ def main(args):
         print(f"[*] BCC: {len(bcc_recipients)} address(es)")
         for i, bcc in enumerate(bcc_recipients, 1):
             print(f"    [{i}] {bcc}")
-    if attachment_objects:
-        print(f"[*] Attachments: {len(attachment_objects)}")
-        for i, att in enumerate(attachment_objects, 1):
-            line = f"    [{i}] {att['name']} | {att['contentType']} | inline={att['isInline']}"
-            if att.get("contentId"):
-                line += f" | CID={att['contentId']}"
-            print(line)
 
-    content_type = "text" if args.text else "html"
-    send_mail(
-        access_token=access_token,
-        subject=args.subject if args.subject else "",
-        email_body=email_body,
-        recipients=recipients,
-        attachment_objects=attachment_objects,
-        sleep_time=args.sleep,
-        jitter=args.jitter if args.jitter else 0.0,
-        subject_list=subject_list,
-        content_type=content_type,
-        cc_recipients=cc_recipients if cc_recipients else None,
-        bcc_recipients=bcc_recipients if bcc_recipients else None
-    )
+    if smtp_mode:
+        if not args.smtp_from:
+            raise SystemExit("[!] --smtp-from is required when using SMTP mode.")
+        if not args.smtp_user or not args.smtp_password:
+            raise SystemExit("[!] --smtp-user and --smtp-password are required for SMTP mode.")
+
+        attachments = args.attachments or []
+        inline_flags = args.is_inline or []
+
+        if attachments:
+            if len(attachments) != len(inline_flags):
+                raise SystemExit("[!] -a/--attachments and -i/--is-inline must have the same number of arguments.")
+            print(f"[*] Attachments: {len(attachments)}")
+            for i, (path, is_inline) in enumerate(zip(attachments, inline_flags), 1):
+                ctype = sniff_mime(path)
+                print(f"    [{i}] {path.name} | {ctype} | inline={is_inline}")
+
+        send_mail_smtp(
+            smtp_server=args.smtp_server,
+            smtp_port=args.smtp_port,
+            smtp_user=args.smtp_user,
+            smtp_password=args.smtp_password,
+            smtp_from=args.smtp_from,
+            subject=args.subject if args.subject else "",
+            email_body=email_body,
+            recipients=recipients,
+            attachments=attachments,
+            inline_flags=inline_flags,
+            sleep_time=args.sleep,
+            jitter=args.jitter if args.jitter else 0.0,
+            subject_list=subject_list,
+            content_type=content_type,
+            cc_recipients=cc_recipients if cc_recipients else None,
+            bcc_recipients=bcc_recipients if bcc_recipients else None,
+            use_ssl=args.smtp_ssl,
+            importance=args.importance,
+        )
+
+    else:
+        # Graph API mode
+        attachment_objects = []
+        if args.attachments:
+            if len(args.attachments) != len(args.is_inline):
+                print("[!] -a/--attachments and -i/--is-inline must have the same number of arguments")
+                sys.exit(2)
+            try:
+                attachment_objects = build_attachments(
+                    attachments=args.attachments,
+                    inline_flags=args.is_inline
+                )
+            except RuntimeError as e:
+                raise SystemExit(str(e))
+
+        if attachment_objects:
+            print(f"[*] Attachments: {len(attachment_objects)}")
+            for i, att in enumerate(attachment_objects, 1):
+                line = f"    [{i}] {att['name']} | {att['contentType']} | inline={att['isInline']}"
+                if att.get("contentId"):
+                    line += f" | CID={att['contentId']}"
+                print(line)
+
+        auth_result = get_graph_tokens(verbose=args.verbose, force_new=args.new_auth)
+        access_token = auth_result.tokens["access_token"]
+
+        send_mail(
+            access_token=access_token,
+            subject=args.subject if args.subject else "",
+            email_body=email_body,
+            recipients=recipients,
+            attachment_objects=attachment_objects,
+            sleep_time=args.sleep,
+            jitter=args.jitter if args.jitter else 0.0,
+            subject_list=subject_list,
+            content_type=content_type,
+            cc_recipients=cc_recipients if cc_recipients else None,
+            bcc_recipients=bcc_recipients if bcc_recipients else None,
+        )
+
 
 class BuildParser(argparse.ArgumentParser):
     def format_help(self):
@@ -564,7 +849,7 @@ class BuildParser(argparse.ArgumentParser):
 
 if __name__ == "__main__":
     parser = BuildParser(
-        description="Email sender via Microsoft Graph API",
+        description="Email sender via Microsoft Graph API / SMTP",
         formatter_class=argparse.RawDescriptionHelpFormatter
     )
 
@@ -599,7 +884,7 @@ if __name__ == "__main__":
     parser.add_argument("-a", "--attachments", type=existing_file, nargs="+",
                        help="Attachment files", default=[])
     parser.add_argument("-i", "--is-inline", type=parse_bool, nargs="+",
-                       help="Defines whether attachments are inline or not (true/false). It must always be specified when there are attachments.", default=[])
+                       help="Defines whether attachments are inline or not (true/false). Must match the number of --attachments.", default=[])
 
     parser.add_argument("-T", "--sleep", type=int, default=DEFAULT_SLEEP_SECONDS,
                        help=f"Sleep between requests in seconds (default: {DEFAULT_SLEEP_SECONDS} = 5 minutes)")
@@ -610,12 +895,31 @@ if __name__ == "__main__":
     parser.add_argument("-j", "--jitter", type=parse_float_range,
                         help="Jitter factor (0.0 to 1.0). Adds random variation to sleep time. Example: 0.3 = +30%% variation.")
 
-    parser.add_argument("-v", "--verbose", action="store_true", help="If specified, will print the decoded JWT after authentication.")
+    # SMTP options
+    smtp_group = parser.add_argument_group("SMTP", "Use SMTP instead of Graph API")
+    smtp_group.add_argument("--smtp-server", type=str, default=None,
+                            help="SMTP server hostname.")
+    smtp_group.add_argument("--smtp-port", type=int, default=587,
+                            help="SMTP port (default: 587). Use 465 with --smtp-ssl.")
+    smtp_group.add_argument("--smtp-user", type=str, default=None,
+                            help="SMTP username.")
+    smtp_group.add_argument("--smtp-password", type=str, default=None,
+                            help="SMTP password.")
+    smtp_group.add_argument("--smtp-from", type=str, default=None,
+                            help='Sender address. Supports display name: "Name <email@domain.com>".')
+    smtp_group.add_argument("--smtp-ssl", action="store_true",
+                            help="Use SSL/TLS directly (port 465). Default: STARTTLS (port 587).")
+    smtp_group.add_argument("--importance", choices=["high", "normal", "low"], default="normal",
+                            help="Email priority (default: normal).")
 
-    parser.add_argument("--new-auth", action="store_true",
-                       help="Force new authentication, ignoring cached tokens.")
-    parser.add_argument("--clear-cache", action="store_true",
-                       help="Clear token cache and exit.")
+    # Graph API options
+    graph_group = parser.add_argument_group("Graph API", "Options for Graph API mode (ignored in SMTP mode)")
+    graph_group.add_argument("-v", "--verbose", action="store_true",
+                             help="Print the decoded JWT after authentication.")
+    graph_group.add_argument("--new-auth", action="store_true",
+                             help="Force new authentication, ignoring cached tokens.")
+    graph_group.add_argument("--clear-cache", action="store_true",
+                             help="Clear token cache and exit.")
 
     if "--clear-cache" in sys.argv:
         clear_token_cache()
